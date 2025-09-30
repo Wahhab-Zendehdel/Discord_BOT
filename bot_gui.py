@@ -21,8 +21,13 @@ from selenium.webdriver.edge.service import Service
 from selenium.common.exceptions import WebDriverException, NoSuchElementException, TimeoutException
 
 # --- CONFIGURATION / UTILITIES (Merged from config_loader.py) ---
+# Define consistent global defaults for configuration file safety/fallback
+DEFAULT_TRIGGERS = ['@team']
+DEFAULT_REPLY = 'Team Take'
+
 def resource_path(relative_path):
-    """ Get absolute path to resource, works for dev and for PyInstaller. """
+    """ Get absolute path to read-only bundled resource, works for dev and for PyInstaller. 
+        Used only for msedgedriver.exe """
     try:
         base_path = sys._MEIPASS
     except Exception:
@@ -30,37 +35,52 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 CONFIG_FILE = 'config.json'
+# Path for external, editable files (always relative to the executable/script location)
+# This MUST NOT use sys._MEIPASS as we want to save and load from the same directory as the .exe
+EXTERNAL_CONFIG_PATH = os.path.join(os.path.abspath("."), CONFIG_FILE)
+
 
 def load_config():
-    """ Loads configuration from a JSON file. """
-    filepath = resource_path(CONFIG_FILE)
-    print(f"Loading configuration from: {filepath}")
+    """ Loads configuration from the external JSON file. """
+    print(f"Loading configuration from: {EXTERNAL_CONFIG_PATH}")
     try:
-        with open(filepath, 'r') as f:
+        # Use the external path for the config file
+        with open(EXTERNAL_CONFIG_PATH, 'r') as f:
             config = json.load(f)
+        
+        # Validation checks
         if not all(k in config for k in ['TRIGGERS', 'REPLY_TEXT']):
-            print("❌ Configuration Error: 'TRIGGERS' or 'REPLY_TEXT' keys are missing. Using defaults.")
-            return {'TRIGGERS': ['@team'], 'REPLY_TEXT': 'Auto-reply from the bot.'}, True
+            print("❌ Configuration Error: 'TRIGGERS' or 'REPLY_TEXT' keys are missing. Using defaults for missing keys.")
+            # Use config.get(key, default) to keep valid parts and default missing parts
+            return {
+                'TRIGGERS': config.get('TRIGGERS', DEFAULT_TRIGGERS),
+                'REPLY_TEXT': config.get('REPLY_TEXT', DEFAULT_REPLY)
+            }, True
+            
         return config, True
+        
     except FileNotFoundError:
-        print(f"⚠️ Warning: Config file '{CONFIG_FILE}' not found. Creating a default file.")
-        default_config = {'TRIGGERS': ['@team'], 'REPLY_TEXT': 'Auto-reply from the bot.'}
-        save_config(default_config)
+        print(f"⚠️ Warning: Config file '{CONFIG_FILE}' not found at expected location. Creating a default file.")
+        default_config = {'TRIGGERS': DEFAULT_TRIGGERS, 'REPLY_TEXT': DEFAULT_REPLY}
+        # Immediately save the default config to create the file
+        save_config(default_config) 
         return default_config, True
+        
     except json.JSONDecodeError:
         print(f"❌ Critical Error: Config file '{CONFIG_FILE}' is not valid JSON. Using defaults.")
-        return {'TRIGGERS': ['@team'], 'REPLY_TEXT': 'Auto-reply from the bot.'}, False
+        return {'TRIGGERS': DEFAULT_TRIGGERS, 'REPLY_TEXT': DEFAULT_REPLY}, False
+        
     except Exception as e:
             print(f"❌ An unexpected error occurred while loading config: {e}. Using defaults.")
-            return {'TRIGGERS': ['@team'], 'REPLY_TEXT': 'Auto-reply from the bot.'}, False
+            return {'TRIGGERS': DEFAULT_TRIGGERS, 'REPLY_TEXT': DEFAULT_REPLY}, False
 
 def save_config(config_data):
-    """ Saves configuration data to the JSON file. """
-    filepath = os.path.join(os.path.abspath("."), CONFIG_FILE)
+    """ Saves configuration data to the external JSON file. """
     try:
-        with open(filepath, 'w') as f:
+        # Use the external path for the config file
+        with open(EXTERNAL_CONFIG_PATH, 'w') as f:
             json.dump(config_data, f, indent=4)
-        print(f"✅ Configuration saved to: {filepath}")
+        print(f"✅ Configuration saved to: {EXTERNAL_CONFIG_PATH}")
         return True
     except Exception as e:
         print(f"❌ Error saving configuration: {e}")
@@ -86,6 +106,7 @@ class DiscordBot:
             options.add_argument("--start-maximized")
             options.add_argument("--log-level=3")
 
+            # Use resource_path for the bundled msedgedriver.exe
             driver_path = resource_path("msedgedriver.exe")
             service = Service(executable_path=driver_path)
 
@@ -120,10 +141,8 @@ class DiscordBot:
 
         try:
             while self.is_monitoring.is_set():
-                # Re-load config inside the loop to catch external changes (e.g., if we implement hot-reloading)
-                config, _ = load_config()
-                self.triggers = config.get('TRIGGERS', self.triggers)
-                self.reply_text = config.get('REPLY_TEXT', self.reply_text)
+                # Configuration is now only loaded/updated on application start or via the GUI Settings button.
+                # Removed redundant load_config() call here to prevent spam.
                 
                 self.check_for_new_message()
                 time.sleep(1.5) # Polling interval
@@ -147,6 +166,7 @@ class DiscordBot:
                 print(f"📩 New message: {repr(last_text)}")
                 self.last_seen = last_text
 
+                # Use the instance variables, which hold the latest config from the GUI/load_config
                 if any(trigger.lower() in last_text.lower() for trigger in self.triggers):
                     print(f"🤖 Trigger detected (using triggers: {self.triggers}).")
                     self._send_reply()
@@ -165,6 +185,7 @@ class DiscordBot:
         try:
             box = self.driver.find_element(By.CSS_SELECTOR, self.textbox_selector)
             box.click()
+            # Use the instance variable
             box.send_keys(self.reply_text + Keys.ENTER)
             print(f"✅ Reply Sent: '{self.reply_text}'")
         except Exception as e:
@@ -197,7 +218,9 @@ class BotGUI(tk.Tk):
         self.bot_thread = None
         self.log_queue = queue.Queue()
         self.is_running = False
-        self.current_config = {'TRIGGERS': ['@team'], 'REPLY_TEXT': 'Auto-reply from the bot.'}
+        self.current_config = {'TRIGGERS': ['@team'], 'REPLY_TEXT': 'Team Take'}
+        
+        # Initial load of config
         self.current_config, _ = load_config()
 
         self._create_widgets()
@@ -321,6 +344,12 @@ class BotGUI(tk.Tk):
             # 3. Save to file and update GUI instance
             if save_config(new_config):
                 self.current_config = new_config
+                
+                # If the bot instance exists (but isn't monitoring), update its parameters
+                if self.bot_instance:
+                    self.bot_instance.triggers = new_config['TRIGGERS']
+                    self.bot_instance.reply_text = new_config['REPLY_TEXT']
+                    
                 settings_win.destroy()
 
         # Save Button
@@ -358,14 +387,11 @@ class BotGUI(tk.Tk):
             return
 
         # 1. Load config and initialize bot instance (using the current_config)
-        self.current_config, success = load_config()
-        if not success:
-            # If config failed to load/validate and we are using defaults, still proceed
-            pass
-
+        # Config is already loaded in __init__ and updated by settings window
+        
         self.bot_instance = DiscordBot(
             triggers=self.current_config.get('TRIGGERS', []),
-            reply_text=self.current_config.get('REPLY_TEXT', 'Auto-reply from the bot.')
+            reply_text=self.current_config.get('REPLY_TEXT', 'Team Take')
         )
         
         # 2. Setup driver (this opens the Edge browser)
