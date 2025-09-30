@@ -1,0 +1,9 @@
+{
+  "TRIGGERS": [
+    "@Team",
+    "@Teamleader",
+    "@Elite Teamleader",
+    "@High Teamleader"
+  ],
+  "REPLY_TEXT": "Team take"
+}

@@ -1,0 +1,12 @@
+.venv/
+venv/
+env/
+pycache/
+*.pyc
+*.pyo
+build/
+dist/
+*.spec
+.DS_Store
+.vscode/
+*.log
