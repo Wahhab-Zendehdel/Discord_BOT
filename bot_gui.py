@@ -4,15 +4,13 @@
 
 import tkinter as tk
 from tkinter import ttk  # Import ttk for themed widgets
+from tkinter import messagebox
 from tkinter.scrolledtext import ScrolledText
 import threading
 import time
-import requests
 import sys
 import os
 import json
-from contextlib import redirect_stdout
-from io import StringIO
 import queue
 
 # --- CONSOLIDATED LOGIC IMPORTS (Standard Python/External Libraries) ---
@@ -31,26 +29,42 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-def load_config(config_filename='config.json'):
+CONFIG_FILE = 'config.json'
+
+def load_config():
     """ Loads configuration from a JSON file. """
-    filepath = resource_path(config_filename)
+    filepath = resource_path(CONFIG_FILE)
     print(f"Loading configuration from: {filepath}")
     try:
         with open(filepath, 'r') as f:
             config = json.load(f)
         if not all(k in config for k in ['TRIGGERS', 'REPLY_TEXT']):
-            print("❌ Configuration Error: 'TRIGGERS' or 'REPLY_TEXT' keys are missing.")
-            return {}, False
+            print("❌ Configuration Error: 'TRIGGERS' or 'REPLY_TEXT' keys are missing. Using defaults.")
+            return {'TRIGGERS': ['@team'], 'REPLY_TEXT': 'Auto-reply from the bot.'}, True
         return config, True
     except FileNotFoundError:
-        print(f"❌ Critical Error: Config file '{config_filename}' not found. Please create it.")
-        return {}, False
+        print(f"⚠️ Warning: Config file '{CONFIG_FILE}' not found. Creating a default file.")
+        default_config = {'TRIGGERS': ['@team'], 'REPLY_TEXT': 'Auto-reply from the bot.'}
+        save_config(default_config)
+        return default_config, True
     except json.JSONDecodeError:
-        print(f"❌ Critical Error: Config file '{config_filename}' is not valid JSON.")
-        return {}, False
+        print(f"❌ Critical Error: Config file '{CONFIG_FILE}' is not valid JSON. Using defaults.")
+        return {'TRIGGERS': ['@team'], 'REPLY_TEXT': 'Auto-reply from the bot.'}, False
     except Exception as e:
-            print(f"❌ An unexpected error occurred while loading config: {e}")
-            return {}, False
+            print(f"❌ An unexpected error occurred while loading config: {e}. Using defaults.")
+            return {'TRIGGERS': ['@team'], 'REPLY_TEXT': 'Auto-reply from the bot.'}, False
+
+def save_config(config_data):
+    """ Saves configuration data to the JSON file. """
+    filepath = os.path.join(os.path.abspath("."), CONFIG_FILE)
+    try:
+        with open(filepath, 'w') as f:
+            json.dump(config_data, f, indent=4)
+        print(f"✅ Configuration saved to: {filepath}")
+        return True
+    except Exception as e:
+        print(f"❌ Error saving configuration: {e}")
+        return False
 
 # --- DISCORD BOT CLASS (Modified from discord_bot.py) ---
 class DiscordBot:
@@ -101,11 +115,16 @@ class DiscordBot:
         print("Waiting for monitoring signal from GUI...")
         self.is_driver_ready.wait()
         
-        print("✅ Monitoring started.")
+        print("✅ Monitoring started. Checking for triggers...")
         self.is_monitoring.set()
 
         try:
             while self.is_monitoring.is_set():
+                # Re-load config inside the loop to catch external changes (e.g., if we implement hot-reloading)
+                config, _ = load_config()
+                self.triggers = config.get('TRIGGERS', self.triggers)
+                self.reply_text = config.get('REPLY_TEXT', self.reply_text)
+                
                 self.check_for_new_message()
                 time.sleep(1.5) # Polling interval
         except Exception:
@@ -129,7 +148,7 @@ class DiscordBot:
                 self.last_seen = last_text
 
                 if any(trigger.lower() in last_text.lower() for trigger in self.triggers):
-                    print("🤖 Trigger detected.")
+                    print(f"🤖 Trigger detected (using triggers: {self.triggers}).")
                     self._send_reply()
             
         except NoSuchElementException:
@@ -178,60 +197,60 @@ class BotGUI(tk.Tk):
         self.bot_thread = None
         self.log_queue = queue.Queue()
         self.is_running = False
+        self.current_config = {'TRIGGERS': ['@team'], 'REPLY_TEXT': 'Auto-reply from the bot.'}
+        self.current_config, _ = load_config()
 
         self._create_widgets()
         self.after(100, self._process_queue) # Start monitoring queue
 
     def _create_widgets(self):
         # 1. Define Modern Styles using ttk.Style
-        
-        # Frame and Label backgrounds matching the window background
         self.style.configure('Control.TFrame', background='#f3f3f3')
         self.style.configure('LogLabel.TLabel', background='#f3f3f3', foreground='#2b2b2b', font=("Segoe UI", 10, "bold"))
-        
-        # Base button style: flat, modern font, reduced border
         self.style.configure('Modern.TButton', 
                             font=('Segoe UI', 10, 'bold'), 
                             padding=10, 
                             relief='flat', 
-                            background='#e1e1e1', # Very light gray for base state
+                            background='#e1e1e1', 
                             foreground='#2b2b2b',
                             borderwidth=0)
-        
-        # Primary RUN button (Blue - Windows accent color)
         self.style.configure('Run.TButton', background='#0078d4', foreground='white')
         self.style.map('Run.TButton', 
                        background=[('active', '#005a9e'), ('disabled', '#cccccc')],
                        foreground=[('disabled', '#666666')])
-        
-        # Secondary MONITOR button (Green - Success/Go action)
         self.style.configure('Monitor.TButton', background='#107c10', foreground='white')
         self.style.map('Monitor.TButton', 
                        background=[('active', '#0c630c'), ('disabled', '#cccccc')],
                        foreground=[('disabled', '#666666')])
-
-        # Danger STOP button (Red - Stop action)
         self.style.configure('Stop.TButton', background='#d43600', foreground='white')
         self.style.map('Stop.TButton', 
                        background=[('active', '#a32a00'), ('disabled', '#cccccc')],
                        foreground=[('disabled', '#666666')])
+        self.style.configure('Settings.TButton', background='#5e5e5e', foreground='white')
+        self.style.map('Settings.TButton', 
+                       background=[('active', '#3c3c3c')])
                        
         
         # 2. Control Frame (using ttk.Frame)
         control_frame = ttk.Frame(self, padding="10 10 10 10", style='Control.TFrame')
         control_frame.pack(fill='x')
 
-        # Run Button (using ttk.Button)
+        # Run Button
         self.run_btn = ttk.Button(control_frame, text="1. RUN BOT (Open Browser)", command=self._start_bot_thread, 
                                  style='Run.TButton')
         self.run_btn.pack(side=tk.LEFT, padx=10)
 
-        # Start Monitoring Button (using ttk.Button)
+        # Start Monitoring Button
         self.monitor_btn = ttk.Button(control_frame, text="2. START MONITORING", command=self._start_monitoring, 
                                      state=tk.DISABLED, style='Monitor.TButton')
         self.monitor_btn.pack(side=tk.LEFT, padx=10)
+        
+        # Settings Button
+        self.settings_btn = ttk.Button(control_frame, text="SETTINGS", command=self._create_settings_window, 
+                                      style='Settings.TButton')
+        self.settings_btn.pack(side=tk.LEFT, padx=(30, 10))
 
-        # Stop Button (using ttk.Button)
+        # Stop Button
         self.stop_btn = ttk.Button(control_frame, text="STOP", command=self._stop_bot_thread, 
                                   state=tk.DISABLED, style='Stop.TButton')
         self.stop_btn.pack(side=tk.RIGHT, padx=10)
@@ -243,15 +262,75 @@ class BotGUI(tk.Tk):
         self.log_text = ScrolledText(self, state='disabled', height=20, bg="#1e1e1e", fg="#f3f3f3", font=("Consolas", 10), relief=tk.FLAT)
         self.log_text.pack(fill='both', expand=True, padx=10, pady=10)
         
-        # Define color tags for the log window (Windows Terminal inspired)
-        self.log_text.tag_config('error_tag', foreground='#ff5555')       # Red for errors (❌)
-        self.log_text.tag_config('success_tag', foreground='#00ff7f')     # Bright Green for success (✅)
-        self.log_text.tag_config('action_tag', foreground='#00bfff')      # Bright Blue for actions/prompts (👉, ⚙️)
-        self.log_text.tag_config('warning_tag', foreground='#ffff00')     # Yellow for warnings/stops (⚠️, 🛑)
-        self.log_text.tag_config('info_tag', foreground='#f3f3f3')        # Light Gray/White for general info (📩)
+        # Define color tags for the log window
+        self.log_text.tag_config('error_tag', foreground='#ff5555')       
+        self.log_text.tag_config('success_tag', foreground='#00ff7f')     
+        self.log_text.tag_config('action_tag', foreground='#00bfff')      
+        self.log_text.tag_config('warning_tag', foreground='#ffff00')     
+        self.log_text.tag_config('info_tag', foreground='#f3f3f3')        
 
         # Redirect standard output to the log queue
         sys.stdout = self.StdoutRedirector(self.log_queue)
+
+    def _create_settings_window(self):
+        """Creates the pop-up window for configuration settings."""
+        if self.is_running:
+            messagebox.showwarning("Cannot Change Settings", "Please STOP the bot before changing configuration.")
+            return
+
+        settings_win = tk.Toplevel(self)
+        settings_win.title("Bot Settings")
+        settings_win.geometry("500x300")
+        settings_win.configure(bg='#f3f3f3')
+        settings_win.transient(self) # Make the settings window stay on top
+
+        frame = ttk.Frame(settings_win, padding="15", style='Control.TFrame')
+        frame.pack(fill='both', expand=True)
+
+        # Triggers Field
+        ttk.Label(frame, text="Triggers (comma-separated):", style='LogLabel.TLabel').pack(anchor='w', pady=(0, 5))
+        
+        # Convert list of triggers back to comma-separated string for display
+        trigger_str = ", ".join(self.current_config['TRIGGERS'])
+        triggers_var = tk.StringVar(value=trigger_str)
+        triggers_entry = ttk.Entry(frame, textvariable=triggers_var, width=60)
+        triggers_entry.pack(fill='x', pady=(0, 15))
+
+        # Reply Text Field
+        ttk.Label(frame, text="Reply Message:", style='LogLabel.TLabel').pack(anchor='w', pady=(0, 5))
+        reply_var = tk.StringVar(value=self.current_config['REPLY_TEXT'])
+        reply_entry = ttk.Entry(frame, textvariable=reply_var, width=60)
+        reply_entry.pack(fill='x', pady=(0, 20))
+
+        def save_and_close():
+            # 1. Parse and validate inputs
+            new_triggers_str = triggers_var.get().strip()
+            new_triggers = [t.strip() for t in new_triggers_str.split(',') if t.strip()]
+            new_reply = reply_var.get().strip()
+
+            if not new_reply or not new_triggers:
+                 messagebox.showerror("Validation Error", "Triggers and Reply Message cannot be empty.")
+                 return
+
+            # 2. Update config object
+            new_config = {
+                'TRIGGERS': new_triggers,
+                'REPLY_TEXT': new_reply
+            }
+
+            # 3. Save to file and update GUI instance
+            if save_config(new_config):
+                self.current_config = new_config
+                settings_win.destroy()
+
+        # Save Button
+        save_btn = ttk.Button(frame, text="Save Settings", command=save_and_close, style='Monitor.TButton')
+        save_btn.pack(side=tk.RIGHT)
+        
+        # Cancel Button
+        cancel_btn = ttk.Button(frame, text="Cancel", command=settings_win.destroy, style='Modern.TButton')
+        cancel_btn.pack(side=tk.RIGHT, padx=10)
+
 
     def _process_queue(self):
         """Polls the queue for new log messages and updates the text widget."""
@@ -262,7 +341,6 @@ class BotGUI(tk.Tk):
             self.log_text.config(state='normal')
             
             # Ensure the new message starts on a fresh line unless it's the very first entry.
-            # This ensures each log entry is on its own line.
             if self.log_text.index(tk.END) != '1.0':
                 msg = '\n' + msg
             
@@ -279,14 +357,15 @@ class BotGUI(tk.Tk):
             print("Bot is already running.")
             return
 
-        # 1. Load config and initialize bot instance
-        config, success = load_config()
+        # 1. Load config and initialize bot instance (using the current_config)
+        self.current_config, success = load_config()
         if not success:
-            return
+            # If config failed to load/validate and we are using defaults, still proceed
+            pass
 
         self.bot_instance = DiscordBot(
-            triggers=config.get('TRIGGERS', []),
-            reply_text=config.get('REPLY_TEXT', 'Auto-reply from the bot.')
+            triggers=self.current_config.get('TRIGGERS', []),
+            reply_text=self.current_config.get('REPLY_TEXT', 'Auto-reply from the bot.')
         )
         
         # 2. Setup driver (this opens the Edge browser)
@@ -303,6 +382,7 @@ class BotGUI(tk.Tk):
         self.run_btn.config(state=tk.DISABLED)
         self.monitor_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.NORMAL)
+        self.settings_btn.config(state=tk.DISABLED)
 
     def _start_monitoring(self):
         """Handler for the 'START MONITORING' button."""
@@ -326,6 +406,7 @@ class BotGUI(tk.Tk):
             self.run_btn.config(state=tk.NORMAL)
             self.monitor_btn.config(state=tk.DISABLED)
             self.stop_btn.config(state=tk.DISABLED)
+            self.settings_btn.config(state=tk.NORMAL)
             print("Bot stopped.")
 
     def _on_closing(self):
