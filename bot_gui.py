@@ -12,6 +12,9 @@ import sys
 import os
 import json
 import queue
+import subprocess
+import re
+import shutil
 
 # --- CONSOLIDATED LOGIC IMPORTS (Standard Python/External Libraries) ---
 from selenium import webdriver
@@ -19,6 +22,11 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys 
 from selenium.webdriver.edge.service import Service
 from selenium.common.exceptions import WebDriverException, NoSuchElementException, TimeoutException
+
+try:
+    from webdriver_manager.microsoft import EdgeChromiumDriverManager
+except ImportError:
+    EdgeChromiumDriverManager = None
 
 # --- CONFIGURATION / UTILITIES (Merged from config_loader.py) ---
 # Define consistent global defaults for configuration file safety/fallback
@@ -38,6 +46,81 @@ CONFIG_FILE = 'config.json'
 # Path for external, editable files (always relative to the executable/script location)
 # This MUST NOT use sys._MEIPASS as we want to save and load from the same directory as the .exe
 EXTERNAL_CONFIG_PATH = os.path.join(os.path.abspath("."), CONFIG_FILE)
+EDGE_DRIVER_DOWNLOAD_TEMPLATE = 'https://msedgedriver.microsoft.com/{version}/edgedriver_win64.zip'
+EDGE_DRIVER_FALLBACK_DOWNLOAD_URL = 'https://developer.microsoft.com/en-us/microsoft-edge/tools/webdriver/'
+EDGE_DRIVER_MANUAL_INSTRUCTIONS = 'Manual download (download zip, extract msedgedriver.exe next to this app)'
+_EDGE_VERSION_CACHE = None
+
+
+def get_edge_version():
+    """Detects the installed Microsoft Edge version for driver matching."""
+    global _EDGE_VERSION_CACHE
+    if _EDGE_VERSION_CACHE is not None:
+        return _EDGE_VERSION_CACHE
+
+    candidate_paths = []
+
+    exe_from_path = shutil.which("msedge")
+    if exe_from_path:
+        candidate_paths.append(exe_from_path)
+
+    env_bases = [
+        os.environ.get("ProgramFiles"),
+        os.environ.get("ProgramFiles(x86)"),
+        os.environ.get("LOCALAPPDATA"),
+    ]
+
+    for base in env_bases:
+        if base:
+            candidate_paths.append(os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe"))
+
+    seen = set()
+    for raw_path in candidate_paths:
+        if not raw_path:
+            continue
+        norm_path = os.path.normpath(raw_path)
+        key = norm_path.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if os.path.exists(norm_path):
+            try:
+                output = subprocess.check_output([norm_path, "--version"], stderr=subprocess.STDOUT, text=True).strip()
+                match = re.search(r"(\d+\.\d+\.\d+\.\d+)", output)
+                if match:
+                    _EDGE_VERSION_CACHE = match.group(1)
+                    return _EDGE_VERSION_CACHE
+            except Exception:
+                continue
+
+    if sys.platform.startswith("win"):
+        try:
+            import winreg  # type: ignore
+        except ImportError:
+            winreg = None
+        if winreg:
+            subkey = r"Software\Microsoft\Edge\BLBeacon"
+            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                try:
+                    with winreg.OpenKey(hive, subkey) as key:
+                        version, _ = winreg.QueryValueEx(key, "version")
+                        if version:
+                            _EDGE_VERSION_CACHE = version
+                            return version
+                except OSError:
+                    continue
+
+    _EDGE_VERSION_CACHE = None
+    return None
+
+
+def get_manual_driver_help():
+    """Builds a manual download instruction string with the best available URL."""
+    version = get_edge_version()
+    download_url = EDGE_DRIVER_FALLBACK_DOWNLOAD_URL
+    if version:
+        download_url = EDGE_DRIVER_DOWNLOAD_TEMPLATE.format(version=version)
+    return f"{EDGE_DRIVER_MANUAL_INSTRUCTIONS}: {download_url}"
 
 
 def load_config():
@@ -93,38 +176,115 @@ class DiscordBot:
         self.triggers = triggers
         self.reply_text = reply_text
         self.driver = None
+        self.driver_path = None
+        self.driver_update_attempted = False
         self.last_seen = ""
         self.is_monitoring = threading.Event() # Used to stop the loop
         self.is_driver_ready = threading.Event() # Used to signal login is complete
         self.message_selector = "li.messageListItem__5126c div.messageContent_c19a55"
         self.textbox_selector = "div[role='textbox']"
 
+    def _resolve_existing_driver(self):
+        candidates = [resource_path("msedgedriver.exe")]
+        exe_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+        candidates.append(os.path.join(exe_dir, "msedgedriver.exe"))
+        candidates.append(os.path.abspath("msedgedriver.exe"))
+
+        seen = set()
+        for path in candidates:
+            if not path:
+                continue
+            norm_path = os.path.normpath(path)
+            key = norm_path.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if os.path.exists(norm_path):
+                return norm_path
+        return None
+
+    def _download_edge_driver(self):
+        if EdgeChromiumDriverManager is None:
+            print("[INFO] Automatic driver download requires the 'webdriver-manager' package.")
+            return None
+        try:
+            target_version = get_edge_version()
+            if target_version:
+                print(f"[INFO] Attempting to download Edge WebDriver for browser version {target_version}...")
+                manager = EdgeChromiumDriverManager(version=target_version)
+            else:
+                print("[INFO] Attempting to download the latest Edge WebDriver automatically (browser version not detected)...")
+                manager = EdgeChromiumDriverManager()
+            driver_location = manager.install()
+            print(f"[INFO] Edge WebDriver ready at: {driver_location}")
+            return driver_location
+        except Exception as download_err:
+            print(f"[ERROR] Automatic Edge WebDriver download failed: {download_err}")
+            return None
+
+    def _ensure_driver_path(self, force_fresh=False):
+        bundled_path = resource_path("msedgedriver.exe")
+
+        if not force_fresh:
+            existing_driver = self._resolve_existing_driver()
+            if existing_driver:
+                if os.path.normcase(existing_driver) != os.path.normcase(bundled_path):
+                    print(f"[INFO] Using existing Edge WebDriver at: {existing_driver}")
+                return existing_driver
+            print(f"[WARN] Edge WebDriver not found at: {bundled_path}")
+
+        driver_location = self._download_edge_driver()
+        if driver_location:
+            return driver_location
+        print(f"[INFO] {get_manual_driver_help()}")
+        return None
+
     def setup_driver(self):
         """Initializes the Edge WebDriver."""
-        try:
-            options = webdriver.EdgeOptions()
-            options.add_argument("--start-maximized")
-            options.add_argument("--log-level=3")
+        options = webdriver.EdgeOptions()
+        options.add_argument("--start-maximized")
+        options.add_argument("--log-level=3")
 
-            # Use resource_path for the bundled msedgedriver.exe
-            driver_path = resource_path("msedgedriver.exe")
-            service = Service(executable_path=driver_path)
+        attempt_flags = [False]
+        if EdgeChromiumDriverManager is not None:
+            attempt_flags.append(True)
 
-            print("⚙️ Initializing Edge browser and opening Discord...")
-            self.driver = webdriver.Edge(service=service, options=options)
-            self.driver.get("https://discord.com/app")
-            
-            print("\n👉 ACTION REQUIRED: Please log in manually in the Edge window and open your desired channel.")
-            print("Click 'START MONITORING' in the GUI once ready.")
-            return True
-        except WebDriverException as e:
-            print("❌ Driver Setup Error: Could not initialize WebDriver.")
-            print("   Ensure 'msedgedriver.exe' is correct and in the same directory.")
-            print(f"   Details: {e.msg.splitlines()[0]}")
-            return False
-        except Exception as e:
-            print(f"❌ An unexpected error occurred during setup: {e}")
-            return False
+        for force_fresh in attempt_flags:
+            driver_path = self._ensure_driver_path(force_fresh=force_fresh)
+            if not driver_path:
+                continue
+            if force_fresh:
+                print("[INFO] Retrying Edge startup with the freshly downloaded driver.")
+            self.driver_path = driver_path
+            self.driver_update_attempted = force_fresh
+            try:
+                service = Service(executable_path=driver_path)
+
+                print("�??�?? Initializing Edge browser and opening Discord...")
+                self.driver = webdriver.Edge(service=service, options=options)
+                self.driver.get("https://discord.com/app")
+                
+                print("\n�??? ACTION REQUIRED: Please log in manually in the Edge window and open your desired channel.")
+                print("Click 'START MONITORING' in the GUI once ready.")
+                return True
+            except WebDriverException as e:
+                message = getattr(e, "msg", str(e))
+                headline = "�?? Driver Setup Error: Could not initialize WebDriver."
+                print(headline)
+                print("   Ensure 'msedgedriver.exe' is correct and in the same directory.")
+                detail_line = message.splitlines()[0] if isinstance(message, str) else message
+                print(f"   Details: {detail_line}")
+                if not force_fresh and EdgeChromiumDriverManager is not None:
+                    print("[INFO] Attempting to download a fresh Edge WebDriver build automatically...")
+                    continue
+                print(f"[INFO] {get_manual_driver_help()}")
+                return False
+            except Exception as e:
+                print(f"�?? An unexpected error occurred during setup: {e}")
+                return False
+
+        print(f"[ERROR] Unable to initialize Edge WebDriver. {get_manual_driver_help()}")
+        return False
 
     def start_monitoring_loop(self):
         """Starts the main monitoring loop, waiting for the ready signal."""

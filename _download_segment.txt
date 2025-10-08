@@ -1,0 +1,14 @@
+    def _download_edge_driver(self):
+        if EdgeChromiumDriverManager is None:
+            print("[INFO] Automatic driver download requires the 'webdriver-manager' package.")
+            return None
+        try:
+            print("[INFO] Attempting to download the latest Edge WebDriver automatically...")
+            driver_location = EdgeChromiumDriverManager().install()
+            print(f"[INFO] Edge WebDriver ready at: {driver_location}")
+            return driver_location
+        except Exception as download_err:
+            print(f"[ERROR] Automatic Edge WebDriver download failed: {download_err}")
+            return None
+
+
